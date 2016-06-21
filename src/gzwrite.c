@@ -18,8 +18,8 @@ local int gz_init(state)
     int ret;
     z_streamp strm = &(state->strm);
 
-    /* allocate input buffer (double size for gzprintf) */
-    state->in = (unsigned char *)malloc(state->want << 1);
+    /* allocate input buffer */
+    state->in = (unsigned char *)malloc(state->want);
     if (state->in == NULL) {
         gz_error(state, Z_MEM_ERROR, "out of memory");
         return -1;
@@ -47,7 +47,6 @@ local int gz_init(state)
             gz_error(state, Z_MEM_ERROR, "out of memory");
             return -1;
         }
-        strm->next_in = NULL;
     }
 
     /* mark state as initialized */
@@ -82,15 +81,12 @@ local int gz_comp(state, flush)
 
     /* write directly if requested */
     if (state->direct) {
-        while (strm->avail_in) {
-            got = write(state->fd, strm->next_in, strm->avail_in);
-            if (got < 0) {
-                gz_error(state, Z_ERRNO, zstrerror());
-                return -1;
-            }
-            strm->avail_in -= got;
-            strm->next_in += got;
+        got = write(state->fd, strm->next_in, strm->avail_in);
+        if (got < 0 || (unsigned)got != strm->avail_in) {
+            gz_error(state, Z_ERRNO, zstrerror());
+            return -1;
         }
+        strm->avail_in = 0;
         return 0;
     }
 
@@ -101,19 +97,17 @@ local int gz_comp(state, flush)
            doing Z_FINISH then don't write until we get to Z_STREAM_END */
         if (strm->avail_out == 0 || (flush != Z_NO_FLUSH &&
             (flush != Z_FINISH || ret == Z_STREAM_END))) {
-            while (strm->next_out > state->x.next) {
-                got = write(state->fd, state->x.next,
-                            strm->next_out - state->x.next);
-                if (got < 0) {
-                    gz_error(state, Z_ERRNO, zstrerror());
-                    return -1;
-                }
-                state->x.next += got;
+            have = (unsigned)(strm->next_out - state->x.next);
+            if (have && ((got = write(state->fd, state->x.next, have)) < 0 ||
+                         (unsigned)got != have)) {
+                gz_error(state, Z_ERRNO, zstrerror());
+                return -1;
             }
             if (strm->avail_out == 0) {
                 strm->avail_out = state->size;
                 strm->next_out = state->out;
             }
+            state->x.next = strm->next_out;
         }
 
         /* compress */
@@ -315,8 +309,7 @@ int ZEXPORT gzputs(file, str)
 /* -- see zlib.h -- */
 int ZEXPORTVA gzvprintf(gzFile file, const char *format, va_list va)
 {
-    unsigned len, left;
-    char *next;
+    int size, len;
     gz_statep state;
     z_streamp strm;
 
@@ -341,47 +334,39 @@ int ZEXPORTVA gzvprintf(gzFile file, const char *format, va_list va)
             return 0;
     }
 
-    /* do the printf() into the input buffer, put length in len -- the input
-       buffer is double-sized just for this function, so there is guaranteed to
-       be state->size bytes available after the current contents */
-    if (strm->avail_in == 0)
-        strm->next_in = state->in;
-    next = (char *)(strm->next_in + strm->avail_in);
-    next[state->size - 1] = 0;
+    /* consume whatever's left in the input buffer */
+    if (strm->avail_in && gz_comp(state, Z_NO_FLUSH) == -1)
+        return 0;
+
+    /* do the printf() into the input buffer, put length in len */
+    size = (int)(state->size);
+    state->in[size - 1] = 0;
 #ifdef NO_vsnprintf
 #  ifdef HAS_vsprintf_void
-    (void)vsprintf(next, format, va);
-    for (len = 0; len < state->size; len++)
-        if (next[len] == 0) break;
+    (void)vsprintf((char *)(state->in), format, va);
+    for (len = 0; len < size; len++)
+        if (state->in[len] == 0) break;
 #  else
-    len = vsprintf(next, format, va);
+    len = vsprintf((char *)(state->in), format, va);
 #  endif
 #else
 #  ifdef HAS_vsnprintf_void
-    (void)vsnprintf(next, state->size, format, va);
-    len = strlen(next);
+    (void)vsnprintf((char *)(state->in), size, format, va);
+    len = strlen((char *)(state->in));
 #  else
-    len = vsnprintf(next, state->size, format, va);
+    len = vsnprintf((char *)(state->in), size, format, va);
 #  endif
 #endif
 
     /* check that printf() results fit in buffer */
-    if (len == 0 || len >= state->size || next[state->size - 1] != 0)
+    if (len <= 0 || len >= (int)size || state->in[size - 1] != 0)
         return 0;
 
-    /* update buffer and position, compress first half if past that */
-    strm->avail_in += len;
+    /* update buffer and position, defer compression until needed */
+    strm->avail_in = (unsigned)len;
+    strm->next_in = state->in;
     state->x.pos += len;
-    if (strm->avail_in >= state->size) {
-        left = strm->avail_in - state->size;
-        strm->avail_in = state->size;
-        if (gz_comp(state, Z_NO_FLUSH) == -1)
-            return 0;
-        memcpy(state->in, state->in + state->size, left);
-        strm->next_in = state->in;
-        strm->avail_in = left;
-    }
-    return (int)len;
+    return len;
 }
 
 int ZEXPORTVA gzprintf(gzFile file, const char *format, ...)
@@ -405,8 +390,7 @@ int ZEXPORTVA gzprintf (file, format, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10,
     int a1, a2, a3, a4, a5, a6, a7, a8, a9, a10,
         a11, a12, a13, a14, a15, a16, a17, a18, a19, a20;
 {
-    unsigned len, left;
-    char *next;
+    int size, len;
     gz_statep state;
     z_streamp strm;
 
@@ -435,52 +419,44 @@ int ZEXPORTVA gzprintf (file, format, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10,
             return 0;
     }
 
-    /* do the printf() into the input buffer, put length in len -- the input
-       buffer is double-sized just for this function, so there is guaranteed to
-       be state->size bytes available after the current contents */
-    if (strm->avail_in == 0)
-        strm->next_in = state->in;
-    next = (char *)(strm->next_in + strm->avail_in);
-    next[state->size - 1] = 0;
+    /* consume whatever's left in the input buffer */
+    if (strm->avail_in && gz_comp(state, Z_NO_FLUSH) == -1)
+        return 0;
+
+    /* do the printf() into the input buffer, put length in len */
+    size = (int)(state->size);
+    state->in[size - 1] = 0;
 #ifdef NO_snprintf
 #  ifdef HAS_sprintf_void
-    sprintf(next, format, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12,
-            a13, a14, a15, a16, a17, a18, a19, a20);
+    sprintf((char *)(state->in), format, a1, a2, a3, a4, a5, a6, a7, a8,
+            a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20);
     for (len = 0; len < size; len++)
-        if (next[len] == 0)
-            break;
+        if (state->in[len] == 0) break;
 #  else
-    len = sprintf(next, format, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
-                  a12, a13, a14, a15, a16, a17, a18, a19, a20);
+    len = sprintf((char *)(state->in), format, a1, a2, a3, a4, a5, a6, a7, a8,
+                  a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20);
 #  endif
 #else
 #  ifdef HAS_snprintf_void
-    snprintf(next, state->size, format, a1, a2, a3, a4, a5, a6, a7, a8, a9,
-             a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20);
-    len = strlen(next);
+    snprintf((char *)(state->in), size, format, a1, a2, a3, a4, a5, a6, a7, a8,
+             a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20);
+    len = strlen((char *)(state->in));
 #  else
-    len = snprintf(next, state->size, format, a1, a2, a3, a4, a5, a6, a7, a8,
-                   a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20);
+    len = snprintf((char *)(state->in), size, format, a1, a2, a3, a4, a5, a6,
+                   a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18,
+                   a19, a20);
 #  endif
 #endif
 
     /* check that printf() results fit in buffer */
-    if (len == 0 || len >= state->size || next[state->size - 1] != 0)
+    if (len <= 0 || len >= (int)size || state->in[size - 1] != 0)
         return 0;
 
-    /* update buffer and position, compress first half if past that */
-    strm->avail_in += len;
+    /* update buffer and position, defer compression until needed */
+    strm->avail_in = (unsigned)len;
+    strm->next_in = state->in;
     state->x.pos += len;
-    if (strm->avail_in >= state->size) {
-        left = strm->avail_in - state->size;
-        strm->avail_in = state->size;
-        if (gz_comp(state, Z_NO_FLUSH) == -1)
-            return 0;
-        memcpy(state->in, state->in + state->size, left);
-        strm->next_in = state->in;
-        strm->avail_in = left;
-    }
-    return (int)len;
+    return len;
 }
 
 #endif
